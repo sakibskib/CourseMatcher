@@ -77,6 +77,12 @@ button.primary:disabled{background:#9aa7b8;cursor:default}
 .empty p{max-width:420px;margin:0 auto;font-size:.9rem}
 .small{font-size:.78rem;color:var(--ink-soft);margin-top:10px}
 footer{margin-top:40px;font-family:var(--mono);font-size:.72rem;color:var(--ink-soft)}
+button.verify{background:var(--bronze);color:#fff;border:0;border-radius:6px;padding:9px 16px;font-weight:600;font-family:var(--body);font-size:.85rem;cursor:pointer}
+button.verify:hover{background:#8f6a2b}
+button.verify:disabled{background:#c9b68c;cursor:default}
+.verdict{margin-top:10px;padding:9px 12px;border-radius:6px;font-size:.84rem;background:#f2f4f7}
+.verdict.hi{background:#e2f2e9}.verdict.mid{background:var(--bronze-soft)}.verdict.lo{background:#f4e4df}
+.match.best{outline:2px solid var(--bronze);outline-offset:-1px}
 @media(prefers-reduced-motion:reduce){*{transition:none!important}}
 </style>
 </head>
@@ -114,6 +120,10 @@ footer{margin-top:40px;font-family:var(--mono);font-size:.72rem;color:var(--ink-
     <div class="results-head">
       <h2>Candidate equivalencies</h2>
       <div class="meta" id="resultMeta"></div>
+    </div>
+    <div id="verifyRow" hidden style="display:flex;gap:12px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
+      <button class="verify" id="verifyBtn">Verify with Claude</button>
+      <span class="small" id="verifyNote" style="margin-top:0"></span>
     </div>
     <div id="results">
       <div class="empty"><p>Enter a transfer course on the left. Results show the top UCO catalog matches ranked by a blend of semantic similarity and keyword overlap, with credit-hour and level checks.</p></div>
@@ -167,7 +177,7 @@ env.allowLocalModels = false;
 
 const MODEL = 'Xenova/bge-small-en-v1.5';
 const DIM = 384;
-const DB_KEY = 'uco-emb-v1-' + COURSES.length;
+const DB_KEY = 'uco-emb-v2-' + COURSES.length;
 
 function idb() {
   return new Promise((res, rej) => {
@@ -197,13 +207,31 @@ async function idbSet(k, v) {
 
 let embedder = null, docEmb = null;
 
+async function sane() {
+  // Self-test: embeddings must be finite, and similar texts must beat dissimilar ones.
+  const d = await embedBatch([
+    'Survey of general, organic and biochemistry for nursing students.',
+    'Introductory chemistry course covering organic chemistry and biochemistry.',
+    'History of medieval European art and architecture.'
+  ]);
+  for (let i = 0; i < d.length; i++) if (!Number.isFinite(d[i])) return false;
+  const cos = (a, b) => { let s = 0; for (let k = 0; k < DIM; k++) s += d[a * DIM + k] * d[b * DIM + k]; return s; };
+  const simAB = cos(0, 1), simAC = cos(0, 2);
+  return simAB > 0.75 && simAB > simAC + 0.05;
+}
+
 async function loadEmbedder() {
   setStatus('Loading embedding model…');
   try {
     embedder = await pipeline('feature-extraction', MODEL, { device: 'webgpu', dtype: 'q8' });
-  } catch {
-    embedder = await pipeline('feature-extraction', MODEL, { dtype: 'q8' });
+    if (await sane()) return;
+    console.warn('WebGPU embeddings failed sanity check; falling back to WASM.');
+  } catch (e) {
+    console.warn('WebGPU unavailable:', e.message);
   }
+  setStatus('Loading embedding model (compatibility mode)…');
+  embedder = await pipeline('feature-extraction', MODEL, { dtype: 'q8' });
+  if (!(await sane())) throw new Error('Embedding model failed its sanity check in this browser.');
 }
 
 async function embedBatch(texts) {
@@ -211,12 +239,22 @@ async function embedBatch(texts) {
   return out.data; // Float32Array, texts.length * DIM
 }
 
-async function buildIndex() {
-  const cached = await idbGet(DB_KEY);
+async function indexIntact() {
+  // Re-embed a known course and confirm the stored vector matches (guards against a corrupted cache).
+  const probe = COURSES[0].title + '. ' + COURSES[0].description;
+  const q = await embedBatch([probe]);
+  let s = 0;
+  for (let d = 0; d < DIM; d++) s += q[d] * docEmb[d];
+  return Number.isFinite(s) && s > 0.98;
+}
+
+async function buildIndex(force) {
+  idbSet('uco-emb-v1-' + COURSES.length, null); // clear obsolete cache
+  const cached = force ? null : await idbGet(DB_KEY);
   if (cached && cached.length === COURSES.length * DIM) {
     docEmb = cached;
-    setStatus('Semantic index loaded from cache.');
-    return;
+    if (await indexIntact()) { setStatus('Semantic index loaded from cache.'); return; }
+    console.warn('Cached index failed integrity check; rebuilding.');
   }
   progTrack.hidden = false;
   docEmb = new Float32Array(COURSES.length * DIM);
@@ -230,6 +268,7 @@ async function buildIndex() {
     setStatus('Indexing catalog… ' + done + ' / ' + COURSES.length);
     await new Promise(r => setTimeout(r)); // keep UI responsive
   }
+  if (!(await indexIntact())) throw new Error('Index build produced inconsistent embeddings in this browser.');
   await idbSet(DB_KEY, docEmb);
   progTrack.hidden = true;
   setStatus('Semantic index built and cached.');
@@ -276,14 +315,78 @@ async function search() {
   const W_SEM = 0.65, W_KW = 0.35;
   const scored = COURSES.map((c, i) => ({ c, i, sem: semN[i], kw: kw[i], raw: sem[i], score: W_SEM * semN[i] + W_KW * kw[i] }));
   scored.sort((a, b) => b.score - a.score);
-  render(scored.slice(0, 10), { hours, level });
+  lastSearch = { title, desc, hours, level, top: scored.slice(0, 10) };
+  render(lastSearch.top, { hours, level });
   goBtn.disabled = false; setStatus('Done.');
+}
+
+/* ---------- Claude verification (works when this page runs as a Claude artifact) ---------- */
+let lastSearch = null;
+
+async function verifyWithClaude() {
+  if (!lastSearch) return;
+  const btn = document.getElementById('verifyBtn');
+  btn.disabled = true; btn.textContent = 'Asking Claude…';
+  const t = lastSearch;
+  const cand = t.top.slice(0, 8).map((r, i) =>
+    `${i + 1}. ${r.c.code} — ${r.c.title} (${r.c.credit_hours} cr): ${r.c.description}`).join('\n');
+  const prompt = `You are a university articulation analyst. A student wants to transfer this course to UCO:
+
+Title: ${t.title || '(not given)'}
+Credit hours: ${t.hours ?? '(not given)'}
+Course number: ${document.getElementById('tLevel').value || '(not given)'}
+Description: ${t.desc}
+
+Candidate UCO equivalents (retrieved by search — may include poor matches):
+${cand}
+
+Judge true course equivalence: content coverage, intended audience, level, and credit hours. Respond ONLY with JSON, no markdown fences, in this shape:
+{"best": <candidate number or null if none are equivalent>, "verdicts": [{"n": 1, "equivalent": "yes"|"partial"|"no", "reason": "<one sentence>"}], "note": "<one-sentence overall recommendation>"}
+Include a verdict for every candidate.`;
+  try {
+    const resp = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 1000, messages: [{ role: 'user', content: prompt }] })
+    });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const data = await resp.json();
+    const text = data.content.map(x => x.text || '').join('').replace(/```json|```/g, '').trim();
+    const v = JSON.parse(text);
+    applyVerdicts(v);
+    btn.textContent = 'Verified ✓';
+  } catch (e) {
+    console.error(e);
+    btn.textContent = 'Verify with Claude';
+    btn.disabled = false;
+    document.getElementById('verifyNote').textContent =
+      'Verification unavailable here — it works when this app runs inside Claude (as an artifact). On your own hosting, add a small serverless proxy with an API key.';
+  }
+}
+
+function applyVerdicts(v) {
+  const cards = document.querySelectorAll('.match');
+  (v.verdicts || []).forEach(vd => {
+    const card = cards[vd.n - 1]; if (!card) return;
+    const cls = vd.equivalent === 'yes' ? 'hi' : vd.equivalent === 'partial' ? 'mid' : 'lo';
+    const d = document.createElement('div');
+    d.className = 'verdict ' + cls;
+    d.innerHTML = '<strong>Claude: ' + esc(vd.equivalent) + '</strong> — ' + esc(vd.reason || '');
+    card.appendChild(d);
+    if (v.best === vd.n) card.classList.add('best');
+  });
+  if (v.note) document.getElementById('verifyNote').textContent = 'Claude: ' + v.note;
 }
 
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
 
 function render(top, q) {
-  document.getElementById('resultMeta').textContent = 'top ' + top.length + ' of ' + COURSES.length;
+  const qEcho = (lastSearch.title + ' ' + lastSearch.desc).trim();
+  document.getElementById('resultMeta').textContent = 'top ' + top.length + ' of ' + COURSES.length + ' · query: “' + qEcho.slice(0, 60) + (qEcho.length > 60 ? '…”' : '”');
+  document.getElementById('verifyRow').hidden = false;
+  const vb = document.getElementById('verifyBtn');
+  vb.disabled = false; vb.textContent = 'Verify with Claude';
+  document.getElementById('verifyNote').textContent = '';
   const html = top.map(r => {
     const c = r.c;
     // confidence from raw cosine (calibrated for bge-small) blended with keyword support
@@ -313,6 +416,7 @@ function render(top, q) {
 }
 
 goBtn.addEventListener('click', search);
+document.getElementById('verifyBtn').addEventListener('click', verifyWithClaude);
 
 (async () => {
   try {
